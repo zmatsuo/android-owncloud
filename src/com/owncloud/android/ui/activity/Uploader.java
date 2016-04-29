@@ -79,12 +79,16 @@ import com.owncloud.android.utils.DisplayUtils;
 import com.owncloud.android.utils.ErrorMessageAdapter;
 import com.owncloud.android.utils.UriUtils;
 
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Stack;
 import java.util.Vector;
+import java.util.regex.Pattern;
 
 
 /**
@@ -103,6 +107,7 @@ public class Uploader extends FileActivity
     private AccountManager mAccountManager;
     private Stack<String> mParents;
     private ArrayList<Parcelable> mStreamsToUpload;
+    private String mSaveIntent;
     private String mUploadPath;
     private OCFile mFile;
 
@@ -164,33 +169,19 @@ public class Uploader extends FileActivity
 
     @Override
     protected void setAccount(Account account, boolean savedAccount) {
-        if (somethingToUpload()) {
-            mAccountManager = (AccountManager) getSystemService(Context.ACCOUNT_SERVICE);
-            Account[] accounts = mAccountManager.getAccountsByType(MainApp.getAccountType());
-            if (accounts.length == 0) {
-                Log_OC.i(TAG, "No ownCloud account is available");
-                showDialog(DIALOG_NO_ACCOUNT);
-            } else if (accounts.length > 1 && !mAccountSelected && !mAccountSelectionShowing) {
-                Log_OC.i(TAG, "More than one ownCloud is available");
-                showDialog(DIALOG_MULTIPLE_ACCOUNT);
-                mAccountSelectionShowing = true;
-            } else {
-                if (!savedAccount) {
-                    setAccount(accounts[0]);
-                }
-            }
-
-        } else if (getIntent().getStringExtra(Intent.EXTRA_TEXT) != null) {
-            showErrorDialog(
-                R.string.uploader_error_message_received_piece_of_text,
-                R.string.uploader_error_title_no_file_to_upload
-            );
-
+        mAccountManager = (AccountManager) getSystemService(Context.ACCOUNT_SERVICE);
+        Account[] accounts = mAccountManager.getAccountsByType(MainApp.getAccountType());
+        if (accounts.length == 0) {
+            Log_OC.i(TAG, "No ownCloud account is available");
+            showDialog(DIALOG_NO_ACCOUNT);
+        } else if (accounts.length > 1 && !mAccountSelected && !mAccountSelectionShowing) {
+            Log_OC.i(TAG, "More than one ownCloud is available");
+            showDialog(DIALOG_MULTIPLE_ACCOUNT);
+            mAccountSelectionShowing = true;
         } else {
-            showErrorDialog(
-                R.string.uploader_error_message_no_file_to_upload,
-                R.string.uploader_error_title_no_file_to_upload
-            );
+            if (!savedAccount) {
+                setAccount(accounts[0]);
+            }
         }
 
         super.setAccount(account, savedAccount);
@@ -461,17 +452,58 @@ public class Uploader extends FileActivity
     }
 
     private void prepareStreamsToUpload() {
-        if (getIntent().getAction().equals(Intent.ACTION_SEND)) {
+        Intent intent = getIntent();
+        if (intent.getAction().equals(Intent.ACTION_SEND)) {
+            mSaveIntent = intent.toUri(0);
             mStreamsToUpload = new ArrayList<>();
-            mStreamsToUpload.add(getIntent().getParcelableExtra(Intent.EXTRA_STREAM));
-        } else if (getIntent().getAction().equals(Intent.ACTION_SEND_MULTIPLE)) {
-            mStreamsToUpload = getIntent().getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            mStreamsToUpload.add(intent.getParcelableExtra(Intent.EXTRA_STREAM));
+        } else if (intent.getAction().equals(Intent.ACTION_SEND_MULTIPLE)) {
+            mSaveIntent = intent.toUri(0);
+            mStreamsToUpload = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
         }
     }
 
-    private boolean somethingToUpload() {
-        return (mStreamsToUpload != null && mStreamsToUpload.get(0) != null);
-    }
+	private String renameSafeFilename(String filename) {
+        // https://support.microsoft.com/ja-jp/kb/100108
+		filename = filename.replaceAll("[?]", "_");
+		filename = filename.replaceAll("\"", "_");
+		filename = filename.replaceAll("/", "_");
+		//filename = filename.replaceAll("\\", "_");
+		filename = filename.replaceAll("<", "_");
+		filename = filename.replaceAll(">", "_");
+		filename = filename.replaceAll("[*]", "_");
+		filename = filename.replaceAll("[|]", "_");
+		filename = filename.replaceAll(";", "_");
+		filename = filename.replaceAll("=", "_");
+		filename = filename.replaceAll(",", "_");
+        return filename;
+	}
+
+	private File createTempUrlFile(String url) {
+		File file = new File(this.getCacheDir(), "tmp.url");
+        try {
+            FileWriter fw = new FileWriter(file);
+            fw.write("[InternetShortcut]\r\n");
+            fw.write("URL=" + url + "\r\n");
+            fw.close();
+        } catch (IOException e) {
+            return null;
+        }
+		return file;
+	}
+
+	private File createTempCliptextFile(String text) {
+		File file = new File(this.getCacheDir(), "clipText.txt");
+        FileWriter fw = null;
+        try {
+            fw = new FileWriter(file);
+            fw.write(text + "\n");
+            fw.close();
+        } catch (IOException e) {
+            return null;
+        }
+		return file;
+	}
 
     @SuppressLint("NewApi")
     public void uploadFiles() {
@@ -483,23 +515,59 @@ public class Uploader extends FileActivity
 
             int schemeFileCounter = 0;
 
-            for (Parcelable sourceStream : mStreamsToUpload) {
-                Uri sourceUri = (Uri) sourceStream;
-                if (sourceUri != null) {
-                    String displayName = UriUtils.getDisplayNameForUri(sourceUri, this);
-                    if (displayName == null) {
-                        displayName = generateDiplayName();
+            if (mStreamsToUpload == null || mStreamsToUpload.get(0) == null) {
+                Intent saveIntent = Intent.parseUri(mSaveIntent, 0);
+                if (saveIntent.getType().equals("text/plain")) {
+                    String extraText = saveIntent.getStringExtra(Intent.EXTRA_TEXT);
+                    String subjectText = saveIntent.getStringExtra(Intent.EXTRA_SUBJECT);
+                    if (subjectText == null) {
+                        subjectText = saveIntent.getStringExtra(Intent.EXTRA_TITLE);
                     }
-                    String remotePath = mUploadPath + displayName;
+                    if (Pattern.compile("^https?://").matcher(extraText).find()) {
+                        // share from web brouser
+                        File file = createTempUrlFile(extraText);
+                        if (file != null) {
+                            contentUris.add(Uri.fromFile(new File(file.getAbsolutePath())));
+                            if (subjectText == null) {
+                                subjectText = "url";
+                            }
+                            String filename = subjectText + ".url";
+                            filename = renameSafeFilename(filename);
+                            contentRemotePaths.add(mUploadPath + filename);
+                        }
+                    } else {
+                        // simply text meybe
+                        File file = createTempCliptextFile(extraText);
+                        if (file != null) {
+							contentUris.add(Uri.fromFile(new File(file.getAbsolutePath())));
+							if (subjectText == null) {
+								subjectText = "cliptext";
+							}
+							String filename = subjectText + ".txt";
+							filename = renameSafeFilename(filename);
+							contentRemotePaths.add(mUploadPath + filename);
+						}
+                    }
+                }
+            } else {
+                for (Parcelable sourceStream : mStreamsToUpload) {
+                    Uri sourceUri = (Uri) sourceStream;
+                    if (sourceUri != null) {
+                        String displayName = UriUtils.getDisplayNameForUri(sourceUri, this);
+                        if (displayName == null) {
+                            displayName = generateDiplayName();
+                        }
+                        String remotePath = mUploadPath + displayName;
 
-                    if (ContentResolver.SCHEME_CONTENT.equals(sourceUri.getScheme())) {
-                        contentUris.add(sourceUri);
-                        contentRemotePaths.add(remotePath);
+                        if (ContentResolver.SCHEME_CONTENT.equals(sourceUri.getScheme())) {
+                            contentUris.add(sourceUri);
+                            contentRemotePaths.add(remotePath);
 
-                    } else if (ContentResolver.SCHEME_FILE.equals(sourceUri.getScheme())) {
-                        /// file: uris should point to a local file, should be safe let FileUploader handle them
-                        requestUpload(sourceUri.getPath(), remotePath);
-                        schemeFileCounter++;
+                        } else if (ContentResolver.SCHEME_FILE.equals(sourceUri.getScheme())) {
+                            /// file: uris should point to a local file, should be safe let FileUploader handle them
+                            requestUpload(sourceUri.getPath(), remotePath);
+                            schemeFileCounter++;
+                        }
                     }
                 }
             }
